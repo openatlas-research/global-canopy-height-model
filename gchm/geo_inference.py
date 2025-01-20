@@ -13,8 +13,8 @@ model_weights_path = '/path/to/model_weights.pth'
 # preprocess the geojson
 geometry = load_and_validate_geojson(geojson_path)
 
-# define the spatial breakdown of the geojson into a set of tiles to be downloaded
-tiles    = geometry_tiles(geometry, date_start, date_end)
+# define the spatial breakdown of the geojson into a set of tiles to be downloaded - ideally something that is 512 x 512
+tiles    = geojson2tiles(geometry, date_start, date_end)
 
 # download the tiles
 download_sentinel2_tiles(tiles, sentinel_dir)
@@ -25,7 +25,7 @@ preprocess_sentinel2_tiles(sentinel_dir)
 preprocess_esa_tiles(esa_dir)
 
 
-# create a pytorch dataset / dataloader for the tiles
+# create a pytorch dataset / dataloader for the tiles - make sure all preprocessing (normalization, etc.) is the same as during training
 ds = create_sentinel2_dataset(sentinel_dir, input_transforms=input_transforms)
 dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
