@@ -96,66 +96,123 @@ def export_image_to_drive(image, file_name, output_dir, polygon):
 
 
 # Function to get the DLC mask from Dynamic World (GOOGLE/DYNAMICWORLD/V1)
-
+import ee
 import numpy as np
 import requests
 from io import BytesIO
 from datetime import datetime, timedelta
-import ee
+
+# Initialize Earth Engine
+ee.Initialize()
 
 def get_dlc_mask(aoi, date_array):
-    """Retrieve the DLC mask as a numpy array for the given area of interest and list of dates."""
-    dlc_masks = {}  # Dictionary to store masks for each date
-    
-    for start_date in date_array:
-        # Convert the start date to a datetime object and calculate the end date (90 days later)
-        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d")
-        end_date_obj = start_date_obj + timedelta(days=90)
-        end_date = end_date_obj.strftime("%Y-%m-%d")
-        
-        # Load the Dynamic World (DLC) dataset from Google Earth Engine
-        dlc_collection = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
-        
-        # Filter the collection by the area of interest and date range
-        dlc_filtered = dlc_collection.filterBounds(aoi).filterDate(start_date, end_date).first().clip(aoi)
+    """
+    For each date in date_array, tries to get the mask from Dynamic World.
+    If no DW mask is generated (or if it is empty), we use a static mask from ESA WorldCover.
+    The returned mask is a NumPy array (unstructured).
 
-        # Define unwanted land cover classes to exclude (e.g., water, urban, snow, etc.)
-        exclude_classes = [0, 5, 6, 7, 8]  
-        dlc_mask = dlc_filtered.select("label").neq(ee.Image.constant(exclude_classes)).reduce(ee.Reducer.min())
+    Parameters:
+      - aoi: area of interest (an ee.Geometry)
+      - date_array: list of dates (format "YYYY-MM-DD")
 
-        # Convert the mask to a binary format (1 for valid land cover, 0 for excluded areas)
-        dlc_mask_binary = dlc_mask.eq(1)
+    Returns:
+      - Dictionary mapping each date to a NumPy array representing the mask
+    """
 
-        dlc_mask_resampled = dlc_mask_binary.reproject(crs='EPSG:4326', scale=10)
-        # Get the download URL for the mask
-        url = dlc_mask_resampled.getDownloadURL({'scale': 10, 'region': aoi, 'format': 'NPY'})
+    masks = {}  # Dictionary to store masks for each date
 
-        # Download the numpy array from the URL
-        response = requests.get(url, stream=True)
-        if response.status_code == 200:
-            mask_array = np.load(BytesIO(response.content))
-             
-            # Si mask_array est structuré, extraire le premier champ
-            if mask_array.dtype.names is not None:
-                field = mask_array.dtype.names[0]
-                numeric_array = mask_array[field]
+    # --- Load ESA WorldCover mask once ---
+    try:
+        # Load ESA WorldCover v200 (this is a collection, so we take the first image)
+        esa_image = ee.ImageCollection("ESA/WorldCover/v200").first().clip(aoi)
+        # Define excluded classes for ESA (e.g., 50, 60, 70, 80)
+        exclude_classes_esa = [50, 60, 70, 80]
+
+        # Create a binary mask: pixel value is 1 if "Map" is not in excluded classes
+        mask_product = ee.Image(1)
+        for cls in exclude_classes_esa:
+            mask_product = mask_product.multiply(esa_image.select("Map").neq(cls))
+
+        esa_mask_resampled = mask_product.reproject(crs='EPSG:4326', scale=10)
+
+        # Get the download URL for the ESA mask in NPY format
+        url_esa = esa_mask_resampled.getDownloadURL({
+            'scale': 10,
+            'region': aoi,
+            'format': 'NPY'
+        })
+        response_esa = requests.get(url_esa, stream=True)
+        if response_esa.status_code == 200:
+            mask_array_esa = np.load(BytesIO(response_esa.content))
+            if mask_array_esa.dtype.names is not None:
+                field = mask_array_esa.dtype.names[0]
+                esa_mask_numeric = mask_array_esa[field]
             else:
-                numeric_array = mask_array
-            
-            # Vérifier si le masque est entièrement composé de zéros
-            if np.all(numeric_array == 0):
-                print(f"No DLC data for {start_date}. Removing this date from the dictionary.")
-                continue  # On passe cette date si le masque est rempli de zéros
-            
-            # Stocker le masque valide pour la date courante
-            dlc_masks[start_date] = numeric_array
+                esa_mask_numeric = mask_array_esa
+            print("ESA mask successfully loaded.")
         else:
-            print(f"Failed to download DLC mask for {start_date}: HTTP {response.status_code}")
-            dlc_masks[start_date] = None  # Stocker None si le téléchargement échoue
+            print("HTTP error", response_esa.status_code, "while downloading ESA mask.")
+            esa_mask_numeric = None
+    except Exception as e:
+        print("Exception while loading ESA mask:", e)
+        esa_mask_numeric = None
 
-    return dlc_masks
+    # --- Process each date ---
+    for start_date in date_array:
+        mask_numeric = None  # Final mask for this date
+        # Compute the 90-day period from start_date
+        try:
+            start_date_obj = datetime.strptime(start_date, "%Y-%m-%d")
+            end_date_obj = start_date_obj + timedelta(days=90)
+            end_date = end_date_obj.strftime("%Y-%m-%d")
+        except Exception as e:
+            print(f"[{start_date}] Error computing date range: {e}")
+            continue
 
+        # 1. Attempt to get Dynamic World mask
+        try:
+            dlc_collection = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
+            dlc_filtered = dlc_collection.filterBounds(aoi).filterDate(start_date, end_date).first()
+            if dlc_filtered is not None:
+                dlc_filtered = dlc_filtered.clip(aoi)
+                # Define excluded classes for DW (e.g., 0, 5, 6, 7, 8)
+                exclude_classes = [0, 5, 6, 7, 8]
+                # Create a binary mask: pixel is 1 if it does not belong to excluded classes
+                dlc_mask = dlc_filtered.select("label").neq(ee.Image.constant(exclude_classes)).reduce(ee.Reducer.min())
+                dlc_mask_binary = dlc_mask.eq(1)
+                dlc_mask_resampled = dlc_mask_binary.reproject(crs='EPSG:4326', scale=10)
 
+                url_dw = dlc_mask_resampled.getDownloadURL({
+                    'scale': 10,
+                    'region': aoi,
+                    'format': 'NPY'
+                })
+                response_dw = requests.get(url_dw, stream=True)
+                if response_dw.status_code == 200:
+                    mask_array = np.load(BytesIO(response_dw.content))
+                    if mask_array.dtype.names is not None:
+                        field = mask_array.dtype.names[0]
+                        mask_numeric = mask_array[field]
+                    else:
+                        mask_numeric = mask_array
+                    print(f"[{start_date}] DW mask generated.")
+                else:
+                    print(f"[{start_date}] HTTP error {response_dw.status_code} for DW.")
+            else:
+                print(f"[{start_date}] No DW image found.")
+        except Exception as e:
+            print(f"[{start_date}] Exception processing DW: {e}")
 
+        # 2. If DW mask is unavailable or empty, use the preloaded ESA mask
+        if mask_numeric is None or np.all(mask_numeric == 0):
+            print(f"[{start_date}] Using ESA static mask.")
+            mask_numeric = esa_mask_numeric
+
+        if mask_numeric is not None:
+            masks[start_date] = mask_numeric
+        else:
+            print(f"[{start_date}] No mask could be generated.")
+
+    return masks
 
 
